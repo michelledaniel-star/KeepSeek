@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=Merriweather:ital@1&family=Roboto:wght@500&family=Lora:wght@400&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Lora', Georgia, serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Merriweather', Georgia, serif;
+  font-style: italic;
+  letter-spacing: 0.05em;
+}
+
+.subhead {
+  font-family: 'Roboto', sans-serif;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
