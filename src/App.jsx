@@ -9,6 +9,7 @@ import PersonDetail from './components/PersonDetail';
 import MobileUpload from './components/MobileUpload';
 import MobileVideoRecording from './components/MobileVideoRecording';
 import AddItemForm from './components/AddItemForm';
+import AddItemFlow from './components/AddItemFlow';
 import QuestionFlow from './components/QuestionFlow';
 import KeeperProfileSetup from './components/KeeperProfileSetup';
 import Origins from './components/Origins';
@@ -69,6 +70,15 @@ function ProtectedApp() {
     );
   }
 
+  // Temporary preview route for the redesigned camera-first Add Item flow.
+  // Not linked from anywhere in the app yet — visit /add-preview directly
+  // to try it. The old wizard at /add is untouched until this is confirmed
+  // working and gets routed in for real.
+  function AddItemFlowWrapper() {
+    const navigate = useNavigate();
+    return <AddItemFlow onClose={() => navigate('/viewer')} />;
+  }
+
   return (
     <Routes>
       <Route path="/" element={
@@ -97,6 +107,11 @@ function ProtectedApp() {
       <Route path="/flow-test" element={
         <Protected>
           <FlowTestWrapper />
+        </Protected>
+      } />
+      <Route path="/add-preview" element={
+        <Protected>
+          <AddItemFlowWrapper />
         </Protected>
       } />
       <Route path="/item/:id" element={
