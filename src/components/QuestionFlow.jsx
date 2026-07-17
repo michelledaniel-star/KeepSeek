@@ -23,9 +23,13 @@ import React, { useState, useRef, useEffect } from 'react';
  *                e.g. { id: 'name', field: 'name', prompt: 'What is this?' }
  *   onComplete — (answers) => void   answers = { [field]: string }
  *   onCancel   — () => void
+ *   photoUrl   — optional. When provided, the item's photo is shown above
+ *                every question so there's something to look at while
+ *                answering — used by AddItemFlow's "Tell the Story Now".
+ *                Omit for question sets with no associated photo.
  */
 
-const QuestionFlow = ({ questions, onComplete, onCancel }) => {
+const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
   const [index, setIndex] = useState(0);
   const [answers, setAnswers] = useState({});
   const [isRecording, setIsRecording] = useState(false);
@@ -244,6 +248,15 @@ const QuestionFlow = ({ questions, onComplete, onCancel }) => {
           }}
           className="w-full max-w-md"
         >
+          {photoUrl && (
+            <div className="flex justify-center mb-6">
+              <img
+                src={photoUrl}
+                alt=""
+                className="w-32 h-32 md:w-40 md:h-40 object-cover rounded-xl ring-1 ring-gray-200"
+              />
+            </div>
+          )}
           <h2 className="font-heading italic tracking-[0.02em] text-2xl md:text-3xl text-center mb-8 text-gray-900">
             {current.prompt}
           </h2>

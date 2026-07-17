@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { supabase } from '../services/supabase';
-import { createItem, addItemImage, createStory, fetchItems } from '../services/airtable';
+import { createItem, updateItem, addItemImage, createStory, fetchItems } from '../services/airtable';
 import { uploadImage } from '../services/cloudinary';
 import QuestionFlow from './QuestionFlow';
 import PhotoReviewScreen from './PhotoReviewScreen';
@@ -10,17 +10,25 @@ const genId = () =>
   (typeof crypto !== 'undefined' && crypto.randomUUID) ? crypto.randomUUID() : `${Date.now()}_${Math.random()}`;
 
 /**
- * AddItemFlow — the redesigned, camera-first "Add Item" experience.
+ * AddItemFlow — the redesigned "Add Item" experience.
  * See KeepSeek Add Item Redesign Plan v2 (Drive) for the full spec.
+ *
+ * Photo capture opens the phone's native camera app per photo (via a file
+ * input with capture="environment"), rather than a custom in-app live
+ * preview. That's a deliberate choice made after testing: a browser-built
+ * camera view can't get zoom or flash on any platform, and can't get flash
+ * at all on iPhone (Apple blocks web apps from controlling it), plus it
+ * loses the auto-rotation a native camera photo already has built in.
+ * Handing the actual shutter off to the OS camera app gets all of that
+ * back for free, at the cost of a brief app-switch per photo.
  *
  * Fast Flow and Easy Flow are one screen: take photos of whatever's in
  * front of you, tap Next Item to lock the current one in and start the
- * next, or tap Tell the Story Now any time to record a story for the item
- * you're currently shooting. The moment an item is locked in (Next Item,
- * or Tell the Story Now), it becomes a real saved row — not a local
- * draft — with name/category left blank to fill in later. Photos stay as
- * free local previews until that moment, so culling rejects never costs
- * an upload.
+ * next, or tap Tell the Story Now any time to record a name + story for
+ * the item you're currently shooting. The moment an item is locked in
+ * (Next Item, or Tell the Story Now), it becomes a real saved row — not a
+ * local draft. Photos stay as free local previews until that moment, so
+ * culling rejects never costs an upload.
  *
  * Not yet wired into /add — this is reachable at /add-preview for testing
  * before it replaces the old 4-step wizard (see task: "Route new flow in
@@ -29,12 +37,8 @@ const genId = () =>
 export default function AddItemFlow({ onClose }) {
   const { keeperId, keeperSlug } = useAuth();
 
-  const videoRef = useRef(null);
-  const canvasRef = useRef(null);
-  const streamRef = useRef(null);
+  const fileInputRef = useRef(null);
 
-  const [cameraReady, setCameraReady] = useState(false);
-  const [cameraError, setCameraError] = useState(false);
   const [defaultStatus, setDefaultStatus] = useState('draft');
 
   // The item currently being photographed — not yet saved to the database.
@@ -42,10 +46,16 @@ export default function AddItemFlow({ onClose }) {
   const [mainPhotoId, setMainPhotoId] = useState(null);
   const [finalizing, setFinalizing] = useState(false);
 
+  // Brief "✓ Item saved" confirmation shown right after Next Item locks an
+  // item in, so it's unmistakable that batch is done and a new one is
+  // starting — not just an empty screen with no explanation.
+  const [justSaved, setJustSaved] = useState(false);
+
   const [showReview, setShowReview] = useState(false);
   const [reviewInitialId, setReviewInitialId] = useState(null);
 
-  const [storyTargetItemId, setStoryTargetItemId] = useState(null);
+  // { id, imageUrl } of the item currently being asked about, or null.
+  const [storyTarget, setStoryTarget] = useState(null);
 
   // The persistent gallery underneath the camera.
   const [items, setItems] = useState([]);
@@ -54,39 +64,6 @@ export default function AddItemFlow({ onClose }) {
   // "Add another photo to something I already saved" overlay.
   const [quickAddItem, setQuickAddItem] = useState(null);
   const [quickAddUploading, setQuickAddUploading] = useState(false);
-
-  // --- Camera setup ---
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 1280 } },
-          audio: false,
-        });
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop());
-          return;
-        }
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play().catch(() => {});
-        }
-        setCameraReady(true);
-      } catch (err) {
-        console.error('Camera access error:', err);
-        setCameraError(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-    };
-  }, []);
 
   // --- Default status: draft if this keeper already has seekers, same rule AddItemForm used ---
   useEffect(() => {
@@ -119,21 +96,8 @@ export default function AddItemFlow({ onClose }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const takePhoto = () => {
-    const video = videoRef.current;
-    if (!video || !video.videoWidth) return;
-    const canvas = canvasRef.current || document.createElement('canvas');
-    canvasRef.current = canvas;
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
-    canvas.toBlob((blob) => {
-      if (!blob) return;
-      const id = genId();
-      const previewUrl = URL.createObjectURL(blob);
-      setCurrentPhotos((prev) => [...prev, { id, previewUrl, blob }]);
-      setMainPhotoId((prev) => prev || id);
-    }, 'image/jpeg', 0.92);
+  const triggerCapture = () => {
+    fileInputRef.current?.click();
   };
 
   const handleFilePicked = (e) => {
@@ -163,8 +127,9 @@ export default function AddItemFlow({ onClose }) {
 
   // Uploads whatever's left in currentPhotos (anything explicitly removed
   // via review never got this far, so it never cost an upload) and creates
-  // the real database row. Name and category are left blank on purpose —
-  // this is the "front door" only; details get filled in later.
+  // the real database row. Name is left blank on purpose unless Tell the
+  // Story Now is used — this is the "front door" only; details can be
+  // filled in later. Returns { id, imageUrl } of the new item, or null.
   const finalizeCurrentItem = async () => {
     if (currentPhotos.length === 0) return null;
     setFinalizing(true);
@@ -176,11 +141,13 @@ export default function AddItemFlow({ onClose }) {
         uploadedUrls.push(result.url);
       }
 
+      const mainImageUrl = uploadedUrls[0] || '';
+
       const newItem = await createItem({
         name: '',
         category: '',
         status: defaultStatus,
-        imageUrl: uploadedUrls[0] || '',
+        imageUrl: mainImageUrl,
       }, keeperId);
 
       for (let i = 1; i < uploadedUrls.length; i++) {
@@ -191,7 +158,7 @@ export default function AddItemFlow({ onClose }) {
       resetCurrentItem();
       setShowReview(false);
       await loadGallery();
-      return newItem.id;
+      return { id: newItem.id, imageUrl: mainImageUrl };
     } catch (err) {
       console.error('Error saving item:', err);
       alert("Something went wrong saving that — your photos are still here, so it's safe to try again.");
@@ -202,25 +169,37 @@ export default function AddItemFlow({ onClose }) {
   };
 
   const handleNextItem = async () => {
-    await finalizeCurrentItem();
+    const result = await finalizeCurrentItem();
+    if (result) {
+      setJustSaved(true);
+      setTimeout(() => setJustSaved(false), 1200);
+    }
   };
 
   const handleTellStoryNow = async () => {
-    const itemId = await finalizeCurrentItem();
-    if (itemId) setStoryTargetItemId(itemId);
+    const result = await finalizeCurrentItem();
+    if (result) setStoryTarget(result);
   };
 
   const handleStoryComplete = async (answers) => {
-    const itemId = storyTargetItemId;
-    setStoryTargetItemId(null);
+    const itemId = storyTarget?.id;
+    setStoryTarget(null);
+    if (!itemId) return;
+
+    const name = (answers?.name || '').trim();
     const text = (answers?.story || '').trim();
-    if (!itemId || !text) return;
+
     try {
-      await createStory({ storyType: 'text', textContent: text, itemId });
+      if (name) {
+        await updateItem(itemId, { name }, keeperId);
+      }
+      if (text) {
+        await createStory({ storyType: 'text', textContent: text, itemId });
+      }
       await loadGallery();
     } catch (err) {
-      console.error('Error saving story:', err);
-      alert('The item saved, but the story itself failed to save. You can add it again from the item page.');
+      console.error('Error saving name/story:', err);
+      alert('The item saved, but the name or story failed to save. You can add it again from the item page.');
     }
   };
 
@@ -250,6 +229,7 @@ export default function AddItemFlow({ onClose }) {
   };
 
   const hasCurrentPhotos = currentPhotos.length > 0;
+  const mainPhoto = currentPhotos.find((p) => p.id === mainPhotoId) || currentPhotos[0] || null;
 
   return (
     <div className="fixed inset-0 bg-white z-40 flex flex-col">
@@ -266,18 +246,35 @@ export default function AddItemFlow({ onClose }) {
         </button>
       </div>
 
-      {/* Camera + controls, pinned */}
+      {/* Hidden native-camera input — capture="environment" opens the
+          phone's own camera app (full zoom/flash/rotation) rather than a
+          custom in-app preview. No "multiple" so every tap is a fresh
+          camera launch, matching a rapid shutter-tap rhythm. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/*"
+        capture="environment"
+        onChange={handleFilePicked}
+        className="hidden"
+      />
+
+      {/* Photo preview + capture, pinned */}
       <div className="flex-shrink-0 bg-black">
-        <div className="relative w-full" style={{ height: '38vh', minHeight: '260px' }}>
-          {!cameraError ? (
-            <video ref={videoRef} playsInline muted className="w-full h-full object-cover" />
+        <div className="relative w-full flex items-center justify-center overflow-hidden" style={{ height: '38vh', minHeight: '260px' }}>
+          {hasCurrentPhotos ? (
+            <img
+              src={mainPhoto.previewUrl}
+              alt=""
+              className="max-w-full max-h-full object-contain"
+            />
           ) : (
-            <div className="w-full h-full flex flex-col items-center justify-center gap-3 text-white/70 px-6 text-center">
-              <p className="font-body text-sm">Couldn't access a camera on this device.</p>
-              <label className="cursor-pointer px-6 py-3 bg-white text-black font-subhead text-sm tracking-[0.01em] rounded-full">
-                Choose Photos Instead
-                <input type="file" accept="image/*" multiple onChange={handleFilePicked} className="hidden" />
-              </label>
+            <div className="flex flex-col items-center justify-center gap-2 text-white/60 px-6 text-center">
+              <svg className="w-10 h-10" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+              </svg>
+              <p className="font-body text-sm">Tap below to take a photo</p>
             </div>
           )}
 
@@ -296,25 +293,34 @@ export default function AddItemFlow({ onClose }) {
               ))}
             </div>
           )}
+
+          {/* "Item saved" confirmation flash after Next Item */}
+          {justSaved && (
+            <div className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center gap-2 text-white">
+              <div className="w-12 h-12 rounded-full bg-white/15 flex items-center justify-center">
+                <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                </svg>
+              </div>
+              <p className="font-subhead text-sm tracking-[0.01em]">Item saved — ready for the next one</p>
+            </div>
+          )}
         </div>
 
-        {/* Shutter + secondary controls */}
-        <div className="flex items-center justify-center gap-8 py-4">
-          {!cameraError && (
-            <button
-              type="button"
-              onClick={takePhoto}
-              disabled={!cameraReady || finalizing}
-              aria-label="Take photo"
-              className="w-16 h-16 rounded-full bg-white border-4 border-white/30 disabled:opacity-40"
-            />
-          )}
-          {cameraError && (
-            <label className="cursor-pointer px-5 py-3 bg-white text-black font-subhead text-sm tracking-[0.01em] rounded-full">
-              + Photo
-              <input type="file" accept="image/*" multiple onChange={handleFilePicked} className="hidden" />
-            </label>
-          )}
+        {/* Shutter */}
+        <div className="flex items-center justify-center py-4">
+          <button
+            type="button"
+            onClick={triggerCapture}
+            disabled={finalizing}
+            className="flex items-center gap-2 px-6 py-3 bg-white text-black font-subhead text-sm tracking-[0.01em] rounded-full disabled:opacity-40"
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+            {hasCurrentPhotos ? 'Take Another Photo' : 'Take Photo'}
+          </button>
         </div>
 
         <div className="flex gap-3 px-4 pb-4">
@@ -381,12 +387,18 @@ export default function AddItemFlow({ onClose }) {
         />
       )}
 
-      {/* Tell the story now */}
-      {storyTargetItemId && (
+      {/* Tell the story now — asks for a name first (shown as a header on
+          the item's page, separate from the story text), then the story
+          itself. The item's own photo stays visible the whole time. */}
+      {storyTarget && (
         <QuestionFlow
-          questions={[{ id: 'story', field: 'story', prompt: "What's the story behind this?" }]}
+          photoUrl={storyTarget.imageUrl}
+          questions={[
+            { id: 'name', field: 'name', prompt: 'What is this?' },
+            { id: 'story', field: 'story', prompt: "What's the story behind it?" },
+          ]}
           onComplete={handleStoryComplete}
-          onCancel={() => setStoryTargetItemId(null)}
+          onCancel={() => setStoryTarget(null)}
         />
       )}
 
