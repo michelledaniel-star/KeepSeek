@@ -45,12 +45,17 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
   // last recording started, so a transcript that resolves late never
   // clobbers something they've already typed.
   const userEditedRef = useRef(false);
+  // Always holds the current question index, readable from inside async
+  // callbacks (like a transcription result arriving late) without the
+  // stale-closure problem a plain `index` read would have.
+  const indexRef = useRef(0);
 
   const current = questions[index];
   const isLast = index === questions.length - 1;
 
   // Reset per-question state whenever we move to a new card
   useEffect(() => {
+    indexRef.current = index;
     setTranscript(answers[current?.field] || '');
     setIsRecording(false);
     setIsTranscribing(false);
@@ -91,12 +96,22 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
     });
 
   const startRecording = async () => {
+    // Defensive: if a previous recording on this card was somehow left
+    // running (shouldn't happen once the callers below are fixed, but this
+    // guarantees we never overwrite mediaRecorderRef/streamRef while an old
+    // stream is still live — that's exactly how a stream gets orphaned with
+    // no way to ever stop it, which is what kept the mic indicator on).
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       streamRef.current = stream;
       const mimeType = pickSupportedMimeType();
       const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
       const chunks = [];
+      const recordedForIndex = index;
       userEditedRef.current = false;
       setTranscribeError(null);
 
@@ -106,13 +121,24 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
 
       recorder.onstop = async () => {
         stream.getTracks().forEach((track) => track.stop());
-        streamRef.current = null;
+        if (streamRef.current === stream) {
+          streamRef.current = null;
+        }
+
+        // If the user already moved on to a different question before this
+        // recording finished uploading, drop the result — applying it now
+        // would silently overwrite whatever's in the *current* question's
+        // textarea with an answer to a different question.
+        const stillOnSameQuestion = () => indexRef.current === recordedForIndex;
 
         if (chunks.length === 0) {
-          setTranscribeError("Didn't catch any audio — try recording again, or type your answer.");
+          if (stillOnSameQuestion()) {
+            setTranscribeError("Didn't catch any audio — try recording again, or type your answer.");
+          }
           return;
         }
 
+        if (!stillOnSameQuestion()) return;
         setIsTranscribing(true);
         try {
           const actualMimeType = recorder.mimeType || mimeType || 'audio/webm';
@@ -130,7 +156,9 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
             throw new Error(data?.error || 'Transcription failed');
           }
 
-          if (userEditedRef.current) {
+          if (!stillOnSameQuestion()) {
+            // Moved on while transcribing — discard, same reasoning as above.
+          } else if (userEditedRef.current) {
             // User already started typing while we were transcribing —
             // don't overwrite what they typed.
           } else if (data.text) {
@@ -140,9 +168,11 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
           }
         } catch (err) {
           console.error('Transcription error:', err);
-          setTranscribeError('Could not transcribe that recording — you can type your answer instead.');
+          if (stillOnSameQuestion()) {
+            setTranscribeError('Could not transcribe that recording — you can type your answer instead.');
+          }
         } finally {
-          setIsTranscribing(false);
+          if (stillOnSameQuestion()) setIsTranscribing(false);
         }
       };
 
@@ -155,11 +185,13 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
     }
   };
 
+  // Stops the mic hardware (not just the on-screen "recording" state).
+  // Safe to call even when nothing is recording.
   const stopRecording = () => {
-    if (mediaRecorderRef.current) {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
       mediaRecorderRef.current.stop();
-      setIsRecording(false);
     }
+    setIsRecording(false);
   };
 
   const goToIndex = (nextIndex) => {
@@ -190,6 +222,13 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
   // swaps to the next question once it's actually gone — the same motion
   // a swipe would have produced, just always started by a tap.
   const animateExit = (direction) => {
+    // If the mic is still running when the user taps Skip/Next/Finish, stop
+    // it now — otherwise the recording (and the mic hardware itself) just
+    // keeps running silently in the background after the card changes.
+    if (isRecording) {
+      stopRecording();
+    }
+
     const exitTo = direction * (window.innerWidth || 600);
     setExitX(exitTo);
 
@@ -207,6 +246,15 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
         suppressTransitionRef.current = false;
       });
     }, EXIT_ANIMATION_MS);
+  };
+
+  // Same as animateExit: make sure the mic is actually released before the
+  // whole screen closes, rather than relying solely on unmount cleanup.
+  const handleCancel = () => {
+    if (isRecording) {
+      stopRecording();
+    }
+    onCancel?.();
   };
 
   if (!current) return null;
@@ -230,7 +278,7 @@ const QuestionFlow = ({ questions, onComplete, onCancel, photoUrl }) => {
       {/* Close */}
       <button
         type="button"
-        onClick={onCancel}
+        onClick={handleCancel}
         className="absolute top-5 right-5 w-9 h-9 flex items-center justify-center text-gray-400 hover:text-gray-600"
         aria-label="Close"
       >
